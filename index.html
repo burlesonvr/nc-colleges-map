@@ -1,0 +1,361 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Colleges Across North Carolina</title>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+
+<style>
+html, body, #map {
+    height: 100%;
+    margin: 0;
+    font-family: Arial, sans-serif;
+}
+
+.legend {
+    background: white;
+    padding: 12px;
+    border-radius: 7px;
+    box-shadow: 0 1px 8px #888;
+    font-size: 13px;
+    line-height: 22px;
+    max-width: 225px;
+}
+
+.legend i.swatch {
+    display: inline-block;
+    width: 17px;
+    height: 12px;
+    margin-right: 7px;
+}
+
+.title {
+    font-weight: bold;
+    font-size: 15px;
+    margin-bottom: 5px;
+}
+
+.note {
+    font-size: 11px;
+    line-height: 15px;
+    color: #555;
+}
+
+.status {
+    position: absolute;
+    z-index: 1000;
+    left: 50px;
+    top: 12px;
+    background: white;
+    padding: 7px 10px;
+    border-radius: 4px;
+    box-shadow: 0 1px 5px #999;
+    font-size: 12px;
+}
+</style>
+</head>
+
+<body>
+
+<div id="map"></div>
+<div id="status" class="status">Loading North Carolina data...</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<script>
+
+// Create map
+const map = L.map('map', {
+    center: [35.6, -79.8],
+    zoom: 7,
+    minZoom: 6,
+    maxZoom: 17
+});
+
+// OpenStreetMap basemap
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap contributors',
+    maxZoom: 19
+}).addTo(map);
+
+// Scale bar
+L.control.scale({
+    position: 'bottomleft'
+}).addTo(map);
+
+// Choropleth colors
+const shades = [
+    '#eff3ff',
+    '#bdd7e7',
+    '#6baed6',
+    '#3182bd',
+    '#08519c'
+];
+
+function color(n) {
+    if (n === 0) return shades[0];
+    if (n <= 2) return shades[1];
+    if (n <= 5) return shades[2];
+    if (n <= 10) return shades[3];
+    return shades[4];
+}
+
+// Legend
+const legend = L.control({
+    position: 'topright'
+});
+
+legend.onAdd = function() {
+    const div = L.DomUtil.create('div', 'legend');
+
+    div.innerHTML =
+        '<div class="title">Colleges Across North Carolina</div>' +
+        '<b>Mapped college locations per county</b><br>' +
+        ['0', '1–2', '3–5', '6–10', '11+']
+        .map((label, i) =>
+            '<div><i class="swatch" style="background:' +
+            shades[i] + '"></i>' + label + '</div>'
+        ).join('') +
+        '<hr>' +
+        '<span style="color:#bf5b17">🎓</span> College / university' +
+        '<hr>' +
+        '<div class="note">' +
+        'County boundaries: Rowan County GIS / NC Geodetic Survey.<br>' +
+        'College locations: NC OneMap historical dataset (2007).<br>' +
+        'County counts calculated from mapped college locations.<br>' +
+        'Map: Victoria Burleson' +
+        '</div>';
+
+    return div;
+};
+
+legend.addTo(map);
+
+// Data URLs
+const countyURL =
+'https://gis.rowancountync.gov/arcgis/rest/services/Public/NC_Counties_Information/MapServer/0/query?where=1%3D1&outFields=*&outSR=4326&returnGeometry=true&f=geojson';
+
+const collegesURL =
+'https://services.nconemap.gov/secure/rest/services/NC1Map_Education/MapServer/0/query?where=1%3D1&outFields=*&outSR=4326&returnGeometry=true&f=geojson';
+
+const status = document.getElementById('status');
+
+// Fetch GeoJSON
+async function fetchJSON(url) {
+    const response = await fetch(url);
+    if (!response.ok) {
+        throw new Error('HTTP ' + response.status);
+    }
+    return response.json();
+}
+
+async function getData(local, remote) {
+    try {
+        return await fetchJSON(local);
+    } catch (error) {
+        return fetchJSON(remote);
+    }
+}
+
+// Safe popup text
+function safe(value) {
+    return String(value ?? 'Unknown').replace(
+        /[&<>"']/g,
+        c => ({
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            '"': '&quot;',
+            "'": '&#39;'
+        }[c])
+    );
+}
+
+// Check if point is inside polygon ring
+function insideRing(point, ring) {
+    let inside = false;
+
+    for (
+        let i = 0, j = ring.length - 1;
+        i < ring.length;
+        j = i++
+    ) {
+        const a = ring[i];
+        const b = ring[j];
+
+        if (
+            ((a[1] > point[1]) !== (b[1] > point[1])) &&
+            (point[0] <
+                (b[0] - a[0]) *
+                (point[1] - a[1]) /
+                (b[1] - a[1]) + a[0])
+        ) {
+            inside = !inside;
+        }
+    }
+
+    return inside;
+}
+
+function insidePolygon(point, rings) {
+    if (!rings.length || !insideRing(point, rings[0])) {
+        return false;
+    }
+
+    for (let i = 1; i < rings.length; i++) {
+        if (insideRing(point, rings[i])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+function inCounty(point, geometry) {
+    if (!geometry) return false;
+
+    if (geometry.type === 'Polygon') {
+        return insidePolygon(point, geometry.coordinates);
+    }
+
+    if (geometry.type === 'MultiPolygon') {
+        return geometry.coordinates.some(
+            polygon => insidePolygon(point, polygon)
+        );
+    }
+
+    return false;
+}
+
+// Load both map layers
+Promise.all([
+    getData('assets/nc_counties.geojson', countyURL),
+    getData('assets/nc_colleges.geojson', collegesURL)
+])
+.then(([counties, colleges]) => {
+
+    const points = (colleges.features || []).filter(
+        feature =>
+            feature.geometry?.type === 'Point' &&
+            Array.isArray(feature.geometry.coordinates)
+    );
+
+    const nameFields = [
+        'NAME', 'Name', 'COUNTY',
+        'COUNTYNAME', 'County',
+        'CountyName', 'county',
+        'county_name', 'COUNTY_NAM'
+    ];
+
+    const countyFeatures = (counties.features || []).map(
+        feature => ({
+            ...feature,
+            properties: { ...feature.properties }
+        })
+    );
+
+    // Count mapped colleges within each county
+    countyFeatures.forEach(feature => {
+        feature.properties.mapped_colleges =
+            points.filter(point =>
+                inCounty(
+                    point.geometry.coordinates,
+                    feature.geometry
+                )
+            ).length;
+    });
+
+    // Blue county choropleth
+    const polygons = L.geoJSON({
+        type: 'FeatureCollection',
+        features: countyFeatures
+    }, {
+        style: feature => ({
+            color: '#555',
+            weight: 0.8,
+            fillColor: color(
+                feature.properties.mapped_colleges
+            ),
+            fillOpacity: 0.78
+        }),
+
+        onEachFeature: (feature, layer) => {
+            const properties = feature.properties || {};
+
+            const name = nameFields
+                .map(field => properties[field])
+                .find(Boolean) || 'County';
+
+            layer.bindPopup(
+                '<b>' + safe(name) + '</b><br>' +
+                'Mapped college locations: ' +
+                properties.mapped_colleges
+            );
+
+            layer.on('mouseover', () => {
+                layer.setStyle({
+                    weight: 2,
+                    color: '#111'
+                });
+            });
+
+            layer.on('mouseout', () => {
+                polygons.resetStyle(layer);
+            });
+        }
+    }).addTo(map);
+
+    // College point markers
+    L.geoJSON(colleges, {
+        pointToLayer: (feature, latlng) => {
+            return L.marker(latlng, {
+                icon: L.divIcon({
+                    html:
+                        '<i class="fa-solid fa-graduation-cap" ' +
+                        'style="font-size:15px;color:#bf5b17;' +
+                        'text-shadow:0 0 2px white"></i>',
+                    className: '',
+                    iconSize: [18, 18]
+                })
+            });
+        },
+
+        onEachFeature: (feature, layer) => {
+            const properties = feature.properties || {};
+
+            const key = Object.keys(properties).find(
+                k =>
+                    k.toLowerCase() === 'name' ||
+                    k.toLowerCase().endsWith('_name')
+            );
+
+            layer.bindPopup(
+                '<b>' +
+                safe(key ? properties[key] : 'College or university') +
+                '</b>'
+            );
+        }
+    }).addTo(map);
+
+    map.fitBounds(polygons.getBounds());
+
+    status.textContent =
+        'County shading and college markers loaded';
+
+    setTimeout(() => status.remove(), 4000);
+
+})
+.catch(error => {
+    status.textContent =
+        'Map data unavailable: ' + error.message;
+
+    console.error(error);
+});
+
+</script>
+</body>
+</html>
